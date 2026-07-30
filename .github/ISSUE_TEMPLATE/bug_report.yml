@@ -1,0 +1,46 @@
+name: 下载问题
+description: 报告缺章、排版、保存或兼容性问题
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: input
+    id: book_url
+    attributes:
+      label: 小说目录地址
+      description: 请填写以 /book/数字/ 结尾的完整网址
+      placeholder: https://www.qianyezw.com/book/12251/
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 浏览器和脚本扩展
+      description: 例如 Android Kiwi 124 + Tampermonkey 5.3
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述
+      description: 请说明页面状态、失败章节和实际生成的文件情况
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 控制台错误
+      description: 如方便，请粘贴以“小说下载器”开头的控制台信息
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已经更新到仓库中的最新版本
+          required: true
+        - label: 我确认该问题可以稳定复现
+          required: true

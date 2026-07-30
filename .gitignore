@@ -1,0 +1,8 @@
+node_modules/
+.tmp-qy-*/
+.playwright-mcp/
+*.log
+*.part
+*.txt
+.DS_Store
+Thumbs.db

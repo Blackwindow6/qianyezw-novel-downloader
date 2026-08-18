@@ -1,6 +1,6 @@
 # 新御书屋小说下载器
 
-[![Version](https://img.shields.io/badge/version-2.3.0-16794b)](https://github.com/Blackwindow6/qianyezw-novel-downloader/releases)
+[![Version](https://img.shields.io/badge/version-2.6.0-16794b)](https://github.com/Blackwindow6/qianyezw-novel-downloader/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Validate Userscript](https://github.com/Blackwindow6/qianyezw-novel-downloader/actions/workflows/validate.yml/badge.svg)](https://github.com/Blackwindow6/qianyezw-novel-downloader/actions/workflows/validate.yml)
 
@@ -11,8 +11,10 @@
 - 一键下载整本小说，不限制章节数和分页数
 - 保留原文自然段、换行和章节顺序
 - 自动拼接被网站拆分的章节分页
-- 自适应调节并发速度，手机和电脑使用不同的下载策略
+- 按设备限制并发速度，并以 40 个请求为一批自动续期站点会话
 - 网络失败、限流或页面异常时持续重试，直到成功或用户取消
+- 自动识别站点安全验证，在会话失效后续期并重试请求
+- 下载前重新获取最新目录，避免使用缓存中的过期章节列表
 - 识别网站空白末页、标题型通知和异常 HTML 残片
 - 完整性检查不通过时，不会把缺章文件伪装成完整小说
 - 支持 `GM.download`、`GM_download` 和浏览器原生下载
@@ -38,8 +40,9 @@
 
 脚本针对手机浏览器做了单独适配：
 
-- 手机端使用更稳的自适应并发，减少浏览器卡死和随机缺章
+- 手机端最多使用 4 路并发，减少浏览器卡死和随机缺章
 - 按钮使用适合触摸操作的尺寸，并适配全面屏安全区域
+- 下载界面使用隔离样式，避免被网页样式覆盖或移除
 - 优先调用扩展提供的下载接口，不支持时自动交给浏览器保存
 - 不依赖部分旧移动内核缺少的 `AbortSignal.any` 和 `AbortSignal.timeout`
 

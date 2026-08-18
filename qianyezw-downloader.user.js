@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         新御书屋小说下载器
 // @namespace    https://github.com/Blackwindow6/qianyezw-novel-downloader
-// @version      2.3.0
-// @description  兼容电脑与手机扩展，自适应并发下载保留原文段落的 TXT 小说
+// @version      2.6.0
+// @description  兼容电脑与手机扩展，分批并发续期站点会话，快速稳定下载整本 TXT
 // @author       Blackwindow6
 // @license      MIT
 // @homepageURL  https://github.com/Blackwindow6/qianyezw-novel-downloader
@@ -24,15 +24,18 @@
     window.matchMedia?.("(pointer: coarse)").matches === true;
   const CONCURRENCY_PROFILE = Object.freeze(
     IS_MOBILE_DEVICE
-      ? { initial: 12, minimum: 4, maximum: 24, increaseInterval: 48 }
-      : { initial: 32, minimum: 4, maximum: 64, increaseInterval: 64 },
+      ? { initial: 4, minimum: 2, maximum: 4, increaseInterval: 16 }
+      : { initial: 6, minimum: 2, maximum: 6, increaseInterval: 24 },
   );
+  // 站点会在约 50 个正文请求后重置会话；预留余量并在批次之间主动续期。
+  const SESSION_REQUEST_BUDGET = 40;
   const CONFIG = Object.freeze({
     initialConcurrency: CONCURRENCY_PROFILE.initial,
     minConcurrency: CONCURRENCY_PROFILE.minimum,
     maxConcurrency: CONCURRENCY_PROFILE.maximum,
     concurrencyIncreaseInterval: CONCURRENCY_PROFILE.increaseInterval,
     concurrencyDecreaseFactor: 0.5,
+    sessionRequestBudget: SESSION_REQUEST_BUDGET,
     requestTimeoutMs: 20_000,
     retryBaseDelayMs: 1_000,
     retryMaxDelayMs: 15_000,
@@ -50,7 +53,7 @@
   const PAGE_POSITION_RE = /[（(]\s*(\d+)\s*\/\s*(\d+)\s*[）)]/u;
   const EMPTY_TERMINAL_PAGE_TEXT = "章节内容缺失或章节不存在！请稍后重新尝试！";
   const UI_CSS = `
-        .qy-dl-widget{position:fixed;right:30px;bottom:30px;z-index:99999;display:grid;gap:8px;justify-items:end;font-family:system-ui;-webkit-tap-highlight-color:transparent}
+        .qy-dl-widget{position:fixed;right:30px;bottom:30px;z-index:2147483647;display:grid;gap:8px;justify-items:end;font-family:system-ui;-webkit-tap-highlight-color:transparent}
         .qy-dl-status{box-sizing:border-box;display:flex;align-items:center;gap:10px;max-width:min(360px,calc(100vw - 60px));padding:10px 12px;border:1px solid #d9dedb;border-radius:6px;background:#fff;color:#36413b;box-shadow:0 4px 16px #0003;font-size:13px}.qy-dl-status[hidden]{display:none}.qy-dl-status span{min-width:0;overflow-wrap:anywhere;white-space:pre-wrap}
         .qy-dl-status button{width:36px;height:36px;flex:0 0 36px;border:0;border-radius:4px;background:#e5e9e7;color:#202421;font-size:20px;cursor:pointer;touch-action:manipulation}.qy-dl-start{min-height:44px;padding:12px 20px;border:0;border-radius:6px;background:#16794b;color:#fff;font:600 15px/1.2 system-ui;cursor:pointer;box-shadow:0 4px 16px #0003;touch-action:manipulation}.qy-dl-start:hover{background:#11633d}.qy-dl-start:disabled{background:#8b9490;cursor:not-allowed}
         @media (max-width:640px),(pointer:coarse){.qy-dl-widget{right:12px;right:calc(12px + env(safe-area-inset-right,0px));bottom:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));left:12px;left:calc(12px + env(safe-area-inset-left,0px));justify-items:stretch}.qy-dl-status{width:100%;max-width:none;font-size:14px}.qy-dl-status button{width:44px;height:44px;flex-basis:44px}.qy-dl-start{justify-self:end}}
@@ -71,6 +74,13 @@
     }
   }
 
+  class ChallengePageError extends RetryablePageError {
+    constructor(url) {
+      super(`站点安全验证拦截了请求: ${url}`);
+      this.name = "ChallengePageError";
+    }
+  }
+
   class RequestTimeoutError extends Error {
     constructor(url) {
       super(`请求超时: ${url}`);
@@ -78,12 +88,33 @@
     }
   }
 
-  class AdaptiveRequestScheduler {
+  class FingerprintSessionRefresher {
     constructor() {
+      this.pending = null;
+    }
+
+    refresh(signal) {
+      if (this.pending) return this.pending;
+      this.pending = renewFingerprintSession(signal).finally(() => {
+        this.pending = null;
+      });
+      return this.pending;
+    }
+  }
+
+  const SESSION_REFRESHER = new FingerprintSessionRefresher();
+
+  class AdaptiveRequestScheduler {
+    constructor({ signal, renewSession, onSessionRefresh }) {
       this.active = 0;
       this.limit = CONFIG.initialConcurrency;
       this.queue = [];
       this.successesSinceIncrease = 0;
+      this.requestsSinceRefresh = 0;
+      this.refreshPromise = null;
+      this.signal = signal;
+      this.renewSession = renewSession;
+      this.onSessionRefresh = onSessionRefresh;
     }
 
     run({ operation, signal }) {
@@ -93,6 +124,7 @@
         const onAbort = () => {
           entry.cancelled = true;
           reject(getAbortError(signal));
+          this.drain();
         };
         entry.onAbort = onAbort;
         signal.addEventListener("abort", onAbort, { once: true });
@@ -102,7 +134,18 @@
     }
 
     drain() {
-      while (this.active < this.limit && this.queue.length) {
+      if (this.refreshPromise) return;
+      this.discardCancelledEntries();
+      if (!this.queue.length) return;
+      if (this.requestsSinceRefresh >= CONFIG.sessionRequestBudget) {
+        if (!this.active) this.startSessionRefresh();
+        return;
+      }
+      while (
+        this.active < this.limit &&
+        this.queue.length &&
+        this.requestsSinceRefresh < CONFIG.sessionRequestBudget
+      ) {
         const entry = this.queue.shift();
         if (entry.cancelled) continue;
         entry.signal.removeEventListener("abort", entry.onAbort);
@@ -110,8 +153,49 @@
       }
     }
 
+    discardCancelledEntries() {
+      this.queue = this.queue.filter((entry) => {
+        if (!entry.cancelled) return true;
+        entry.signal.removeEventListener("abort", entry.onAbort);
+        return false;
+      });
+    }
+
+    startSessionRefresh() {
+      if (this.refreshPromise) return;
+      if (this.signal.aborted) {
+        this.rejectQueued(getAbortError(this.signal));
+        return;
+      }
+      this.onSessionRefresh();
+      const refresh = Promise.resolve().then(() =>
+        this.renewSession(this.signal),
+      );
+      this.refreshPromise = refresh;
+      refresh
+        .then(
+          () => {
+            this.requestsSinceRefresh = 0;
+          },
+          (error) => this.rejectQueued(error),
+        )
+        .finally(() => {
+          this.refreshPromise = null;
+          this.drain();
+        });
+    }
+
+    rejectQueued(error) {
+      const entries = this.queue.splice(0);
+      for (const entry of entries) {
+        entry.signal.removeEventListener("abort", entry.onAbort);
+        if (!entry.cancelled) entry.reject(error);
+      }
+    }
+
     start(entry) {
       this.active += 1;
+      this.requestsSinceRefresh += 1;
       Promise.resolve()
         .then(entry.operation)
         .then(entry.resolve, entry.reject)
@@ -144,6 +228,30 @@
       throw new Error(`发现非法章节地址: ${url.href}`);
     }
     return url.href;
+  }
+  function isChallengeDocument(doc, html = "", finalUrl = "") {
+    if (typeof finalUrl === "string" && finalUrl.includes("/challenge.php")) {
+      return true;
+    }
+    const title = (
+      doc.title ||
+      doc.querySelector("title")?.textContent ||
+      ""
+    ).trim();
+    if (title === "安全验证") return true;
+    if (doc.querySelector('script[src*="client_fingerprint.js"]')) return true;
+    return (
+      html.includes("正在验证您的浏览器") && html.includes("client_fingerprint")
+    );
+  }
+  function canExtractBookIndex(doc) {
+    try {
+      extractChapters(doc);
+      getBookTitle(doc);
+      return true;
+    } catch {
+      return false;
+    }
   }
   function extractChapters(doc) {
     const heading = [...doc.querySelectorAll("h2")].find((node) =>
@@ -271,6 +379,114 @@
       },
     });
   }
+
+  function getCookieValue(name) {
+    const prefix = `${name}=`;
+    const entry = document.cookie
+      .split(";")
+      .map((item) => item.trim())
+      .find((item) => item.startsWith(prefix));
+    return entry ? decodeURIComponent(entry.slice(prefix.length)) : null;
+  }
+
+  function getFingerprintCredentials() {
+    const rawFingerprint = getCookieValue("client_fingerprint") ?? "";
+    const parts = rawFingerprint.split("|");
+    const hash = parts.length >= 5 ? parts[1] : rawFingerprint;
+    const version = getCookieValue("client_fingerprint_version");
+    const entropy = getCookieValue("client_fingerprint_entropy");
+    if (!hash || !version || !entropy) {
+      throw new ChallengePageError(location.href);
+    }
+    return Object.freeze({ hash, version, entropy });
+  }
+
+  async function renewFingerprintSession(signal) {
+    const credentials = getFingerprintCredentials();
+    const endpoint = new URL("/challenge.php", location.origin);
+    endpoint.searchParams.set("redirect", location.href);
+    endpoint.searchParams.set("renew", String(Date.now()));
+    const response = await fetch(endpoint.href, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      },
+      body: new URLSearchParams({
+        action: "verify",
+        fingerprint_hash: credentials.hash,
+        fingerprint_version: credentials.version,
+        fingerprint_entropy: credentials.entropy,
+      }),
+      credentials: "same-origin",
+      cache: "no-store",
+      signal,
+    });
+    if (!response.ok) {
+      throw new HttpStatusError({
+        status: response.status,
+        url: endpoint.href,
+      });
+    }
+    let result;
+    try {
+      result = await response.json();
+    } catch {
+      throw new ChallengePageError(endpoint.href);
+    }
+    if (!result?.ok) throw new ChallengePageError(endpoint.href);
+    console.info("[小说下载器] 已刷新站点访问会话");
+  }
+
+  async function fetchHtmlOnce({ url, signal }) {
+    const response = await fetch(url, {
+      credentials: "same-origin",
+      cache: "no-store",
+      signal,
+    });
+    if (!response.ok)
+      throw new HttpStatusError({ status: response.status, url });
+    return Object.freeze({
+      html: normalizePageHtml(await response.text()),
+      finalUrl: response.url,
+    });
+  }
+
+  function isNetworkTransportError(error) {
+    return (
+      error instanceof TypeError ||
+      error?.name === "TypeError" ||
+      error?.message?.includes("Failed to fetch") === true
+    );
+  }
+
+  async function fetchHtmlWithRecovery({ url, signal }) {
+    try {
+      return await fetchHtmlOnce({ url, signal });
+    } catch (error) {
+      if (!isNetworkTransportError(error) || signal.aborted) throw error;
+      try {
+        await SESSION_REFRESHER.refresh(signal);
+      } catch (refreshError) {
+        console.warn(
+          "[小说下载器] 访问会话刷新失败，保留原网络错误",
+          refreshError,
+        );
+        throw error;
+      }
+      return fetchHtmlOnce({ url, signal });
+    }
+  }
+
+  function parseChapterDocument({ page, url, allowEmptyTerminalPage }) {
+    const doc = new DOMParser().parseFromString(page.html, "text/html");
+    if (isChallengeDocument(doc, page.html, page.finalUrl)) {
+      throw new ChallengePageError(url);
+    }
+    if (hasReadableParagraphs(doc) || isConfirmedTitleOnlyPage(doc)) return doc;
+    if (allowEmptyTerminalPage && isConfirmedEmptyTerminalPage(doc)) return doc;
+    throw new RetryablePageError(`页面缺少有效正文: ${url}`);
+  }
+
   async function fetchDocument({
     url,
     signal,
@@ -278,19 +494,15 @@
   }) {
     const request = createRequestContext(signal);
     try {
-      const response = await fetch(url, {
-        credentials: "same-origin",
-        signal: request.signal,
-      });
-      if (!response.ok)
-        throw new HttpStatusError({ status: response.status, url });
-      const html = normalizePageHtml(await response.text());
-      const doc = new DOMParser().parseFromString(html, "text/html");
-      if (hasReadableParagraphs(doc) || isConfirmedTitleOnlyPage(doc))
-        return doc;
-      if (allowEmptyTerminalPage && isConfirmedEmptyTerminalPage(doc))
-        return doc;
-      throw new RetryablePageError(`页面缺少有效正文: ${url}`);
+      let page = await fetchHtmlWithRecovery({ url, signal: request.signal });
+      try {
+        return parseChapterDocument({ page, url, allowEmptyTerminalPage });
+      } catch (error) {
+        if (!(error instanceof ChallengePageError)) throw error;
+        await SESSION_REFRESHER.refresh(request.signal);
+        page = await fetchHtmlOnce({ url, signal: request.signal });
+        return parseChapterDocument({ page, url, allowEmptyTerminalPage });
+      }
     } catch (error) {
       if (request.didTimeOut()) throw new RequestTimeoutError(url);
       throw error;
@@ -429,7 +641,7 @@
     }
     return (
       error instanceof RetryablePageError ||
-      error instanceof TypeError ||
+      isNetworkTransportError(error) ||
       error?.name === "TimeoutError"
     );
   }
@@ -565,13 +777,23 @@
   }
   class DownloadUi {
     constructor() {
+      const host = document.createElement("div");
+      host.id = "qy-dl-host";
+      host.style.cssText =
+        "all:initial;position:fixed;inset:auto 0 0 auto;z-index:2147483647;pointer-events:none;";
+      const shadow = host.attachShadow({ mode: "closed" });
       const style = document.createElement("style");
       style.textContent = UI_CSS;
       const widget = document.createElement("aside");
       widget.className = "qy-dl-widget";
+      widget.style.pointerEvents = "auto";
       widget.innerHTML = `<div class="qy-dl-status" hidden><span></span><button type="button"></button></div><button type="button" class="qy-dl-start">${BUTTON_LABEL}</button>`;
-      document.head.appendChild(style);
-      document.body.appendChild(widget);
+      shadow.append(style, widget);
+      const mount = () => {
+        if (!host.isConnected) document.documentElement.appendChild(host);
+      };
+      mount();
+      this.remountTimer = setInterval(mount, 2000);
       this.status = widget.querySelector(".qy-dl-status");
       this.info = widget.querySelector(".qy-dl-status span");
       this.action = widget.querySelector(".qy-dl-status button");
@@ -581,9 +803,9 @@
     onStart(handler) {
       this.button.addEventListener("click", handler);
     }
-    begin({ controller, total }) {
+    begin({ controller, total, concurrency }) {
       this.status.hidden = false;
-      this.info.textContent = `正在下载 ${total} 章，并发将根据网络自动调节...`;
+      this.info.textContent = `正在下载 ${total} 章，使用 ${concurrency} 路并发分批获取...`;
       this.button.disabled = true;
       this.button.textContent = "准备中...";
       this.action.textContent = "×";
@@ -598,9 +820,16 @@
       this.button.textContent = `${completed}/${total}`;
       this.info.textContent = `${error ? "失败" : "完成"}: ${chapter.title}`;
     }
-    retry({ chapter, attempt, concurrency, retryDelayMs }) {
+    retry({ chapter, attempt, concurrency, retryDelayMs, error }) {
       const seconds = (retryDelayMs / 1000).toFixed(1);
-      this.info.textContent = `网络拥堵，已降至 ${concurrency} 路\n${seconds} 秒后第 ${attempt} 次重试: ${chapter.title}`;
+      const reason =
+        error?.name === "ChallengePageError"
+          ? "站点安全验证拦截"
+          : "连接暂时中断";
+      this.info.textContent = `${reason}，已降至 ${concurrency} 路\n${seconds} 秒后第 ${attempt} 次重试: ${chapter.title}`;
+    }
+    sessionRefresh() {
+      this.info.textContent = "当前批次已完成，正在续期访问会话...";
     }
     saving() {
       this.button.textContent = "保存中...";
@@ -729,11 +958,29 @@
       setTimeout(() => URL.revokeObjectURL(blobUrl), CONFIG.blobRevokeDelayMs);
     }
   }
-  async function executeDownload({ ui, bookTitle, chapters }) {
+  async function prepareDownload({ ui, chapters }) {
     const controller = new AbortController();
-    const scheduler = new AdaptiveRequestScheduler();
-    ui.begin({ controller, total: chapters.length });
-    const download = await downloadChapters({
+    ui.begin({
+      controller,
+      total: chapters.length,
+      concurrency: CONFIG.initialConcurrency,
+    });
+    if (chapters.length > CONFIG.sessionRequestBudget) {
+      ui.sessionRefresh();
+      await SESSION_REFRESHER.refresh(controller.signal);
+    }
+    return Object.freeze({
+      controller,
+      scheduler: new AdaptiveRequestScheduler({
+        signal: controller.signal,
+        renewSession: (signal) => SESSION_REFRESHER.refresh(signal),
+        onSessionRefresh: () => ui.sessionRefresh(),
+      }),
+    });
+  }
+
+  function runChapterDownloads({ ui, chapters, controller, scheduler }) {
+    return downloadChapters({
       chapters,
       signal: controller.signal,
       scheduler,
@@ -752,9 +999,12 @@
           `[小说下载器] ${chapter.title} 第 ${attempt} 次重试，并发 ${concurrency}，页面 ${url}`,
           error,
         );
-        ui.retry({ chapter, attempt, concurrency, retryDelayMs });
+        ui.retry({ chapter, attempt, concurrency, retryDelayMs, error });
       },
     });
+  }
+
+  async function finishDownload({ ui, bookTitle, chapters, download, signal }) {
     for (const failure of download.failures) {
       console.error(
         "[小说下载器] 章节下载失败",
@@ -762,7 +1012,7 @@
         failure.error,
       );
     }
-    if (download.failures.length && !controller.signal.aborted) {
+    if (download.failures.length && !signal.aborted) {
       const failedNames = download.failures
         .slice(0, 3)
         .map(({ chapter }) => chapter.title)
@@ -782,22 +1032,89 @@
     }
     ui.saving();
     await saveTextFile(file);
-    const message = controller.signal.aborted
+    const message = signal.aborted
       ? `已取消，已保存 ${file.downloaded}/${chapters.length} 章`
       : `已保存 ${file.downloaded}/${chapters.length} 章${download.failures.length ? `，失败 ${download.failures.length} 章` : ""}`;
     ui.finish(message);
   }
+
+  async function executeDownload({ ui, bookTitle, chapters }) {
+    const { controller, scheduler } = await prepareDownload({ ui, chapters });
+    const download = await runChapterDownloads({
+      ui,
+      chapters,
+      controller,
+      scheduler,
+    });
+    await finishDownload({
+      ui,
+      bookTitle,
+      chapters,
+      download,
+      signal: controller.signal,
+    });
+  }
+  function parseBookDocument(page) {
+    const doc = new DOMParser().parseFromString(page.html, "text/html");
+    if (isChallengeDocument(doc, page.html, page.finalUrl)) {
+      throw new ChallengePageError(location.href);
+    }
+    if (!canExtractBookIndex(doc)) {
+      throw new Error("网络目录缺少有效书名或章节列表");
+    }
+    return doc;
+  }
+
+  async function fetchBookDocument(signal) {
+    const request = createRequestContext(signal);
+    try {
+      const page = await fetchHtmlWithRecovery({
+        url: location.href,
+        signal: request.signal,
+      });
+      try {
+        return parseBookDocument(page);
+      } catch (error) {
+        if (!(error instanceof ChallengePageError)) throw error;
+        await SESSION_REFRESHER.refresh(request.signal);
+        return parseBookDocument(
+          await fetchHtmlOnce({ url: location.href, signal: request.signal }),
+        );
+      }
+    } catch (error) {
+      if (request.didTimeOut()) throw new RequestTimeoutError(location.href);
+      throw error;
+    } finally {
+      request.dispose();
+    }
+  }
+  async function resolveBookDocument() {
+    const controller = new AbortController();
+    try {
+      return await fetchBookDocument(controller.signal);
+    } catch (error) {
+      if (error instanceof ChallengePageError) throw error;
+      console.warn("[小说下载器] 网络目录失败，改用当前页面", error);
+      if (!canExtractBookIndex(document)) throw error;
+      return document;
+    }
+  }
   async function handleDownload(ui) {
     try {
-      const chapters = extractChapters(document);
+      const bookDocument = await resolveBookDocument();
+      const chapters = extractChapters(bookDocument);
       await executeDownload({
         ui,
-        bookTitle: getBookTitle(document),
+        bookTitle: getBookTitle(bookDocument),
         chapters,
       });
     } catch (error) {
       console.error("[小说下载器] 下载中止", error);
-      ui.finish(`下载中止：${error.message}`);
+      const message =
+        error instanceof ChallengePageError
+          ? "下载中止：站点安全验证拦截了目录请求，请刷新页面通过验证后再试"
+          : `下载中止：${error.message}`;
+      ui.finish(message);
     }
   }
   function init() {
